@@ -75,9 +75,9 @@ def clean_field(value: str) -> str:
 def parse_score(value: str) -> float | None:
     """
     Parse score an toàn:
-      "6.49"                          → 6.49
-      "N/A1 (scored by - users)..."   → None
-      "N/A"                           → None
+    "6.49"                          → 6.49
+    "N/A1 (scored by - users)..."   → None
+    "N/A"                           → None
     """
     if not value:
         return None
@@ -204,8 +204,7 @@ def build_embed_text(raw: dict, synopsis: str, genres: str) -> str:
 
 def build_metadata(raw: dict, url: str, synopsis: str, genres: str) -> dict:
     # genres đã được merge với Theme từ bước build_embed_text → nhất quán với embed text
-    rec_titles = [r["Title"] for r in raw.get("Recommendations", [])[:MAX_RECS]
-                  if r.get("Title")]
+    rec_titles = [r["Title"] for r in raw.get("Recommendations", [])[:MAX_RECS] if r.get("Title")]
     return {
         "url":          url,
         "title":        raw.get("Title", ""),
@@ -290,8 +289,7 @@ def main():
         theme = raw.get("Theme", "")
         if theme:
             theme_clean = dedup_genres(theme)
-            extra = [t for t in theme_clean.split(", ")
-                     if t and t.lower() not in genres.lower()]
+            extra = [t for t in theme_clean.split(", ") if t and t.lower() not in genres.lower()]
             merged_genres = genres + " | " + ", ".join(extra) if extra else genres
         else:
             merged_genres = genres
