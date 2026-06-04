@@ -31,6 +31,16 @@ import unicodedata
 import logging
 from pathlib import Path
 import requests
+import sys
+
+# Reconfigure stdout/stderr to utf-8 for Windows console Unicode safety
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MAL_INPUT_FILE    = Path("cleaned_anime_data_v2.json")          # raw MAL data hoặc prepared list
@@ -63,31 +73,54 @@ log = logging.getLogger(__name__)
 # ════════════════════════════════════════════════════════════════════════════
 
 PAGE_QUERY = """
-query ($page: Int) {
+query ($page: Int, $start_greater: FuzzyDateInt, $start_lesser: FuzzyDateInt) {
   Page(page: $page, perPage: 50) {
     pageInfo {
       hasNextPage
-      currentPage
-      total
     }
-    media(type: ANIME, sort: ID) {
+    media(type: ANIME, startDate_greater: $start_greater, startDate_lesser: $start_lesser, sort: ID) {
       id
       title {
         romaji
         english
         native
+        userPreferred
       }
       tags {
         name
+        category
         rank
         isGeneralSpoiler
         isMediaSpoiler
+      }
+      averageScore
+      meanScore
+      description(asHtml: false)
+      genres
+      season
+      seasonYear
+      status
+      episodes
+      duration
+      reviews(perPage: 5, sort: RATING_DESC) {
+        nodes {
+          id
+          summary
+          rating
+          score
+        }
       }
       recommendations(perPage: 10, sort: RATING_DESC) {
         nodes {
           rating
           mediaRecommendation {
-            title { romaji english }
+            id
+            title {
+              romaji
+              english
+              native
+              userPreferred
+            }
           }
         }
       }
@@ -129,53 +162,94 @@ def gql_request(query: str, variables: dict, attempt: int = 0) -> dict | None:
 
 
 def fetch_all_anilist() -> list[dict]:
-    """Fetch toàn bộ AniList catalogue qua pagination. Resume từ checkpoint."""
+    """Fetch toàn bộ AniList catalogue bằng cách chia nhỏ theo startDate range để tránh giới hạn 5000 offset và lỗi seasonYear của AniList."""
     catalogue: list[dict] = []
 
-    # Resume từ checkpoint nếu có
-    start_page = 1
+    # Load existing cache if any
     if ANILIST_RAW_FILE.exists():
         with ANILIST_RAW_FILE.open(encoding="utf-8") as f:
             catalogue = json.load(f)
         log.info("Loaded existing cache: %d entries", len(catalogue))
 
+    # We partition by years. We represent pre-1940 as a single partition "1939".
+    # Range of partitions: 1939 (covers pre-1940), 1940, 1941, ..., 2030.
+    start_year = 1939
+    start_page = 1
     if CHECKPOINT_FILE.exists():
-        start_page = int(CHECKPOINT_FILE.read_text().strip()) + 1
-        log.info("Resuming from page %d", start_page)
+        try:
+            parts = CHECKPOINT_FILE.read_text().strip().split(",")
+            if len(parts) == 2:
+                start_year = int(parts[0])
+                start_page = int(parts[1])
+                log.info("Resuming from partition/year %d, page %d", start_year, start_page)
+            else:
+                # Reset if checkpoint is in old ID format
+                start_year = 1939
+                start_page = 1
+                log.info("Resetting checkpoint to 1939, page 1")
+        except ValueError:
+            log.info("Could not parse checkpoint, starting from 1939, page 1")
 
-    page = start_page
-    while True:
-        data = gql_request(PAGE_QUERY, {"page": page})
-        if not data:
-            log.error("Failed at page %d, stopping", page)
-            break
+    is_first_year = True
+    for year in range(start_year, 2031):
+        page = start_page if is_first_year else 1
+        is_first_year = False
 
-        page_data  = data.get("Page", {})
-        page_info  = page_data.get("pageInfo", {})
-        media_list = page_data.get("media", [])
+        if year == 1939:
+            log.info("--- Starting Pre-1940 Partition ---")
+            variables = {
+                "page": page,
+                "start_greater": 19000000,
+                "start_lesser": 19391231
+            }
+        else:
+            log.info("--- Starting Year %d ---", year)
+            variables = {
+                "page": page,
+                "start_greater": year * 10000,
+                "start_lesser": year * 10000 + 1231
+            }
 
-        for media in media_list:
-            if media:
-                catalogue.append(media)
+        while True:
+            data = gql_request(PAGE_QUERY, variables)
+            if not data:
+                log.error("Failed at year %d, page %d, stopping", year, page)
+                break
 
-        total_pages = (page_info.get("total", 0) + PER_PAGE - 1) // PER_PAGE
-        log.info(
-            "Page %d/%d — fetched %d entries (total so far: %d)",
-            page, total_pages, len(media_list), len(catalogue),
-        )
+            page_data  = data.get("Page", {})
+            page_info  = page_data.get("pageInfo", {})
+            media_list = page_data.get("media", [])
 
-        # Save checkpoint + incremental cache
-        CHECKPOINT_FILE.write_text(str(page))
-        with ANILIST_RAW_FILE.open("w", encoding="utf-8") as f:
-            json.dump(catalogue, f, ensure_ascii=False)
+            if not media_list:
+                log.info("Year %d — no more media at page %d", year, page)
+                break
 
-        if not page_info.get("hasNextPage"):
-            log.info("✅ Fetched all %d AniList entries", len(catalogue))
-            break
+            new_entries = 0
+            for media in media_list:
+                if media:
+                    # Deduplicate to prevent overlapping elements
+                    if not any(item.get("id") == media["id"] for item in catalogue):
+                        catalogue.append(media)
+                        new_entries += 1
 
-        page += 1
-        time.sleep(DELAY)
+            log.info(
+                "Year %d, Page %d fetched — got %d entries (%d new, total catalog so far: %d)",
+                year, page, len(media_list), new_entries, len(catalogue),
+            )
 
+            # Save checkpoint + incremental cache
+            CHECKPOINT_FILE.write_text(f"{year},{page}")
+            with ANILIST_RAW_FILE.open("w", encoding="utf-8") as f:
+                json.dump(catalogue, f, ensure_ascii=False, indent=2)
+
+            if not page_info.get("hasNextPage") or len(media_list) < PER_PAGE:
+                break
+
+            page += 1
+            variables["page"] = page
+            time.sleep(DELAY)
+
+    log.info("✅ Finished fetching AniList catalogue! Total entries: %d", len(catalogue))
     return catalogue
 
 
@@ -255,7 +329,7 @@ def get_all_anilist_titles(media: dict) -> list[str]:
     """Lấy tất cả variant tên của 1 AniList entry."""
     title_obj = media.get("title") or {}
     titles = []
-    for key in ("english", "romaji", "native"):
+    for key in ("english", "romaji", "native", "userPreferred"):
         val = title_obj.get(key, "")
         if val:
             titles.append(val)
@@ -284,8 +358,9 @@ def parse_anilist_entry(media: dict) -> dict:
             continue
         name = tag.get("name", "")
         rank = tag.get("rank", 0)
+        category = tag.get("category", "")
         if name and rank >= 60:
-            tags.append({"name": name, "rank": rank})
+            tags.append({"name": name, "rank": rank, "category": category})
     tags.sort(key=lambda x: x["rank"], reverse=True)
 
     # Recommendations
@@ -298,18 +373,43 @@ def parse_anilist_entry(media: dict) -> dict:
         if not rec_med or not rating:
             continue
         t = rec_med.get("title") or {}
-        title = t.get("english") or t.get("romaji") or ""
+        title = t.get("english") or t.get("romaji") or t.get("userPreferred") or t.get("native") or ""
         if title:
             recs.append({"title": title, "rating": rating})
+
+    # Reviews
+    reviews = []
+    for node in ((media.get("reviews") or {}).get("nodes") or []):
+        if not node:
+            continue
+        summary = node.get("summary", "")
+        rating  = node.get("rating", 0)
+        score   = node.get("score", 0)
+        reviews.append({
+            "id": node.get("id"),
+            "summary": summary,
+            "rating": rating,
+            "score": score
+        })
 
     al_titles = get_all_anilist_titles(media)
 
     return {
         "anilist_id":    media.get("id"),
         "anilist_title": al_titles[0] if al_titles else "",
+        "average_score": media.get("averageScore"),
+        "mean_score":    media.get("meanScore"),
+        "description":   media.get("description"),
+        "genres":        media.get("genres", []),
+        "status":        media.get("status"),
+        "episodes":      media.get("episodes"),
+        "duration":      media.get("duration"),
+        "season":        media.get("season"),
+        "season_year":   media.get("seasonYear"),
         "tags":          [t["name"] for t in tags[:20]],
         "tag_details":   tags[:20],
         "anilist_recs":  recs,
+        "reviews":       reviews,
     }
 
 
